@@ -1,0 +1,189 @@
+# docker-compose.yml — Stack Docker Spark + Kafka
+# Corrections apportées :
+#   1. spark-submit : ajout port 8888 (Jupyter)
+#   2. spark-worker : webui-port changé de 8081 → 8082 (conflit avec kafka-ui)
+#   3. kafka-ui     : port host gardé sur 8081
+#   4. spark-submit : profiles supprimé → toujours démarré avec docker-compose up
+
+networks:
+  bigdata-net:
+    driver: bridge
+
+volumes:
+  zookeeper_data:
+  zookeeper_logs:
+  kafka_data:
+
+services:
+
+  # ── ZooKeeper ────────────────────────────────────────────────
+  zookeeper:
+    image: confluentinc/cp-zookeeper:7.6.1
+    container_name: zookeeper
+    networks: [bigdata-net]
+    environment:
+      ZOOKEEPER_CLIENT_PORT: 2181
+      ZOOKEEPER_TICK_TIME: 2000
+    ports:
+      - "2181:2181"
+    volumes:
+      - zookeeper_data:/var/lib/zookeeper/data
+      - zookeeper_logs:/var/lib/zookeeper/log
+    healthcheck:
+      test: ["CMD", "bash", "-c", "echo ruok | nc localhost 2181"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
+  # ── Kafka Broker ─────────────────────────────────────────────
+  kafka:
+    image: confluentinc/cp-kafka:7.6.1
+    container_name: kafka
+    networks: [bigdata-net]
+    depends_on:
+      zookeeper:
+        condition: service_healthy
+    ports:
+      - "9092:9092"     # accès depuis Windows (producers Python)
+      - "29092:29092"   # accès inter-conteneurs Docker
+    environment:
+      KAFKA_BROKER_ID: 1
+      KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:29092,PLAINTEXT_HOST://localhost:9092
+      KAFKA_LISTENERS: PLAINTEXT://0.0.0.0:29092,PLAINTEXT_HOST://0.0.0.0:9092
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
+      KAFKA_LOG_RETENTION_HOURS: 48
+      KAFKA_MESSAGE_MAX_BYTES: 10485760
+    volumes:
+      - kafka_data:/var/lib/kafka/data
+    healthcheck:
+      test: ["CMD", "kafka-broker-api-versions", "--bootstrap-server", "localhost:9092"]
+      interval: 15s
+      timeout: 10s
+      retries: 5
+    restart: unless-stopped
+
+  # ── Kafka UI — http://localhost:8081 ─────────────────────────
+  kafka-ui:
+    image: provectuslabs/kafka-ui:latest
+    container_name: kafka-ui
+    networks: [bigdata-net]
+    depends_on:
+      kafka:
+        condition: service_healthy
+    ports:
+      - "8081:8080"     # inchangé
+    environment:
+      KAFKA_CLUSTERS_0_NAME: local-cluster
+      KAFKA_CLUSTERS_0_BOOTSTRAPSERVERS: kafka:29092
+      KAFKA_CLUSTERS_0_ZOOKEEPER: zookeeper:2181
+    restart: unless-stopped
+
+  # ── Spark Master — http://localhost:9091 ─────────────────────
+  spark-master:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: sentiment-spark:latest
+    container_name: spark-master
+    user: "root"
+    networks: [bigdata-net]
+    entrypoint: ["/opt/spark/bin/spark-class"]
+    command:
+      - "org.apache.spark.deploy.master.Master"
+      - "--host"
+      - "spark-master"
+      - "--port"
+      - "7077"
+      - "--webui-port"
+      - "9090"
+    environment:
+      - SPARK_HOME=/opt/spark
+      - HOME=/root
+      - USER=root
+      - LOGNAME=root
+      - PYTHONPATH=/workspace
+      - PYSPARK_PYTHON=python3
+      - PYSPARK_DRIVER_PYTHON=python3
+    ports:
+      - "9091:9090"     # Spark Master UI
+      - "7077:7077"     # Spark Master port
+    volumes:
+      - ./data:/workspace/data
+      - ./src:/workspace/src
+      - ./config:/workspace/config
+      - ./notebooks:/workspace/notebooks
+    restart: unless-stopped
+
+  # ── Spark Worker ─────────────────────────────────────────────
+  spark-worker:
+    image: sentiment-spark:latest
+    container_name: spark-worker
+    user: "root"
+    networks: [bigdata-net]
+    depends_on:
+      - spark-master
+    entrypoint: ["/opt/spark/bin/spark-class"]
+    command:
+      - "org.apache.spark.deploy.worker.Worker"
+      - "spark://spark-master:7077"
+      - "--cores"
+      - "2"
+      - "--memory"
+      - "4G"
+      - "--webui-port"
+      - "8082"          # CORRIGÉ : 8081 → 8082 (évite conflit avec kafka-ui)
+    environment:
+      - SPARK_HOME=/opt/spark
+      - HOME=/root
+      - USER=root
+      - LOGNAME=root
+      - PYTHONPATH=/workspace
+      - PYSPARK_PYTHON=python3
+      - PYSPARK_DRIVER_PYTHON=python3
+    ports:
+      - "8082:8082"     # Spark Worker UI (optionnel, pour debug)
+    volumes:
+      - ./data:/workspace/data
+      - ./src:/workspace/src
+      - ./config:/workspace/config
+    restart: unless-stopped
+
+  # ── Spark Submit — jobs PySpark + Jupyter ────────────────────
+  # Démarre automatiquement avec docker-compose up (plus de profile)
+  # Jupyter accessible sur http://localhost:8888
+  spark-submit:
+    image: sentiment-spark:latest
+    container_name: spark-submit
+    user: "root"
+    networks: [bigdata-net]
+    depends_on:
+      - spark-master
+      - kafka
+    environment:
+      - SPARK_MASTER=spark://spark-master:7077
+      - SPARK_HOME=/opt/spark
+      - HOME=/root
+      - USER=root
+      - LOGNAME=root
+      - PYTHONPATH=/workspace
+      - PYSPARK_PYTHON=python3
+      - PYSPARK_DRIVER_PYTHON=python3
+      - KAFKA_BOOTSTRAP_SERVERS=kafka:29092
+    ports:
+      - "8888:8888"     # AJOUTÉ : Jupyter Notebook
+      - "4040:4040"     # AJOUTÉ : Spark Application UI (jobs en cours)
+    volumes:
+      - ./data:/workspace/data
+      - ./src:/workspace/src
+      - ./config:/workspace/config
+      - ./notebooks:/workspace/notebooks
+    working_dir: /workspace
+    command: ["tail", "-f", "/dev/null"]
+    # profiles supprimé : spark-submit démarre avec docker-compose up -d
+    restart: unless-stopped
