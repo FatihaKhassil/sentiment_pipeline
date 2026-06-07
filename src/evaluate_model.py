@@ -63,7 +63,8 @@ def compute_confusion_matrix(predictions_df):
         .count()
         .orderBy("label", "prediction")
     )
-    cm.show(title="Matrice de Confusion")
+    logger.info("Matrice de Confusion")
+    cm.show()
 
     # Extraction des valeurs
     cm_dict = {row["label"] * 10 + int(row["prediction"]): row["count"]
@@ -82,14 +83,22 @@ def analyze_neutral_layer(predictions_df):
     """
     Analyse la distribution des labels après application de la couche Neutral.
     """
-    neutral_udf = get_neutral_udf(CONFIDENCE_THRESHOLD)
+    from pyspark.sql.functions import udf
+    from pyspark.sql.types import DoubleType
 
-    enriched = predictions_df.withColumn(
-        "sentiment_label",
-        neutral_udf(
-            F.col("prediction"),
-            F.col("probability").getItem(0),
-            F.col("probability").getItem(1)
+    neutral_udf = get_neutral_udf(CONFIDENCE_THRESHOLD)
+    # Extraction des probabilités via UDF (le vecteur sparse "probability"
+    # ne supporte pas getItem — voir spark_streaming_consumer_apple.py)
+    prob_neg_udf = udf(lambda v: float(v[0]), DoubleType())
+    prob_pos_udf = udf(lambda v: float(v[1]), DoubleType())
+
+    enriched = (
+        predictions_df
+        .withColumn("prob_negative", prob_neg_udf(F.col("probability")))
+        .withColumn("prob_positive", prob_pos_udf(F.col("probability")))
+        .withColumn(
+            "sentiment_label",
+            neutral_udf(F.col("prediction"), F.col("prob_negative"), F.col("prob_positive"))
         )
     )
 
@@ -107,13 +116,19 @@ def analyze_neutral_layer(predictions_df):
 
 def analyze_error_samples(predictions_df, n: int = 5):
     """Affiche des exemples de tweets mal classifiés."""
+    from pyspark.sql.functions import udf
+    from pyspark.sql.types import DoubleType
+
+    prob_neg_udf = udf(lambda v: float(v[0]), DoubleType())
+    prob_pos_udf = udf(lambda v: float(v[1]), DoubleType())
+
     logger.info(f"\n── Exemples de tweets mal classifiés (n={n}) ──")
     errors = (
         predictions_df
         .filter(F.col("label") != F.col("prediction"))
         .select("text", "label", "prediction",
-                F.col("probability").getItem(0).alias("p_neg"),
-                F.col("probability").getItem(1).alias("p_pos"))
+                prob_neg_udf(F.col("probability")).alias("p_neg"),
+                prob_pos_udf(F.col("probability")).alias("p_pos"))
         .limit(n)
     )
     errors.show(truncate=60)

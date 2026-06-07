@@ -1,191 +1,154 @@
 """
-src/kafka_producer_sentiment140.py
-Phase 2 — Producteur Kafka pour Sentiment140 (simulation flux Big Data).
-
-Lit le fichier sentiment140.csv ligne par ligne et publie chaque tweet
-dans le topic Kafka 'sentiment_stream' à un débit configurable.
-
-Débit par défaut : 1 000 tweets/s → 1,6M tweets en ~27 minutes
-
-Usage :
-    python src/kafka_producer_sentiment140.py
-    python src/kafka_producer_sentiment140.py --delay 0.005 --max-rows 100000
+src/spark_streaming_consumer_sentiment140.py
+Phase 2 — Consommateur Spark Structured Streaming pour Sentiment140.
 """
 
 import sys
-import json
-import csv
-import time
-import argparse
 from pathlib import Path
-from datetime import datetime
 
 ROOT_DIR = Path(__file__).parent.parent
 sys.path.insert(0, str(ROOT_DIR))
 
-from kafka import KafkaProducer
-from kafka.errors import KafkaError
+from pyspark.sql import functions as F
+from pyspark.sql.types import StructType, StructField, StringType, IntegerType
+from pyspark.ml import PipelineModel
+from pyspark.sql.functions import udf
+from pyspark.sql.types import DoubleType
 
 from config.config import (
     KAFKA_BOOTSTRAP_SERVERS, KAFKA_TOPIC_SENTIMENT140,
-    KAFKA_PRODUCER_DELAY_S140, SENTIMENT140_CSV, S140_COLUMNS
+    MODEL_PATH, SENTIMENT140_PREDICTIONS_DIR, CHECKPOINT_DIR_S140,
+    STREAMING_TRIGGER_SECONDS, STREAMING_MAX_OFFSETS,
+    CONFIDENCE_THRESHOLD, SPARK_MASTER,
+    SPARK_DRIVER_MEMORY, SPARK_EXECUTOR_MEMORY
 )
-from src.utils import get_logger
+from src.utils import get_logger, ensure_dirs, clean_text_udf, get_neutral_udf
 
 logger = get_logger(__name__)
 
+KAFKA_MESSAGE_SCHEMA = StructType([
+    StructField("text", StringType(), True),
+    StructField("target", IntegerType(), True),
+    StructField("id", StringType(), True),
+    StructField("ingestion_timestamp", StringType(), True)
+])
 
-def create_producer(bootstrap_servers: str) -> KafkaProducer:
-    """Crée et retourne un KafkaProducer configuré."""
-    producer = KafkaProducer(
-        bootstrap_servers=bootstrap_servers,
-        value_serializer=lambda v: json.dumps(v, ensure_ascii=False).encode("utf-8"),
-        acks="all",                  # Attente confirmation du broker
-        retries=3,
-        batch_size=16384,            # 16 KB par batch
-        linger_ms=5,                 # Attente 5ms pour regrouper les messages
-        compression_type="gzip",     # Compression pour réduire le trafic réseau
-        max_request_size=1048576     # 1 MB max par requête
+
+def run_streaming_consumer():
+    ensure_dirs(SENTIMENT140_PREDICTIONS_DIR, CHECKPOINT_DIR_S140)
+
+    # Import PySpark ici pour eviter les problemes d'initialisation
+    from pyspark.sql import SparkSession
+
+    kafka_package = "org.apache.spark:spark-sql-kafka-0-10_2.12:3.5.1"
+
+    spark = (
+        SparkSession.builder
+        .master(SPARK_MASTER)
+        .appName("SentimentStreaming_Phase2")
+        .config("spark.jars.packages", kafka_package)
+        .config("spark.driver.memory", SPARK_DRIVER_MEMORY)
+        .config("spark.executor.memory", SPARK_EXECUTOR_MEMORY)
+        .config("spark.sql.shuffle.partitions", "8")
+        .getOrCreate()
     )
-    logger.info(f"Producteur Kafka connecté → {bootstrap_servers}")
-    return producer
+    spark.sparkContext.setLogLevel("WARN")
+    logger.info(f"SparkSession creee — Master: {spark.sparkContext.master}")
 
+    # Charger le modele
+    if not MODEL_PATH.exists():
+        raise FileNotFoundError(f"Modele non trouve : {MODEL_PATH}\nLancez d'abord le notebook 03")
+    pipeline_model = PipelineModel.load(str(MODEL_PATH))
+    logger.info("Modele ML charge")
 
-def build_message(row: dict) -> dict:
-    """
-    Construit le message JSON à partir d'une ligne CSV Sentiment140.
+    # UDFs
+    prob_neg_udf = udf(lambda v: float(v[0]), DoubleType())
+    prob_pos_udf = udf(lambda v: float(v[1]), DoubleType())
+    neutral_udf  = get_neutral_udf(CONFIDENCE_THRESHOLD)
 
-    Structure du message :
-        {
-            "text": str,                    # Feature ML principale
-            "target": int,                  # Label original (0=négatif, 4=positif)
-            "id": str,                      # ID du tweet
-            "ingestion_timestamp": str      # Timestamp d'ingestion (ISO 8601)
-        }
-    """
-    return {
-        "text": row.get("text", ""),
-        "target": int(row.get("target", 0)),
-        "id": row.get("id", ""),
-        "ingestion_timestamp": datetime.utcnow().isoformat() + "Z"
-    }
+    # Flux Kafka
+    raw_stream = (
+        spark.readStream
+        .format("kafka")
+        .option("kafka.bootstrap.servers", KAFKA_BOOTSTRAP_SERVERS)
+        .option("subscribe", KAFKA_TOPIC_SENTIMENT140)
+        .option("startingOffsets", "earliest")
+        .option("maxOffsetsPerTrigger", STREAMING_MAX_OFFSETS)
+        .option("failOnDataLoss", "false")
+        .load()
+    )
 
+    # Parsing JSON
+    parsed = (
+        raw_stream
+        .select(
+            F.from_json(F.col("value").cast("string"), KAFKA_MESSAGE_SCHEMA).alias("data"),
+            F.col("timestamp").alias("kafka_timestamp")
+        )
+        .select("data.*", "kafka_timestamp")
+        .filter(F.col("text").isNotNull() & (F.length(F.col("text")) > 0))
+    )
 
-def on_send_success(record_metadata):
-    """Callback appelé en cas de succès d'envoi."""
-    pass  # Silencieux pour les performances — activer pour debug
+    # Nettoyage + inference ML
+    cleaned = parsed.withColumn("text", clean_text_udf(F.col("text")))
+    cleaned = cleaned.filter(F.length(F.col("text")) > 2)
+    predictions = pipeline_model.transform(cleaned)
 
+    # Extraction probabilites + couche Neutral
+    enriched = (
+        predictions
+        .withColumn("prob_negative", prob_neg_udf(F.col("probability")))
+        .withColumn("prob_positive", prob_pos_udf(F.col("probability")))
+        .withColumn("confidence", F.greatest(F.col("prob_negative"), F.col("prob_positive")))
+        .withColumn(
+            "sentiment_label",
+            neutral_udf(F.col("prediction"), F.col("prob_negative"), F.col("prob_positive"))
+        )
+        .withColumn("processing_time", F.current_timestamp())
+        .select(
+            "text",
+            F.col("target").alias("original_target"),
+            F.col("prediction").alias("ml_prediction"),
+            "prob_negative",
+            "prob_positive",
+            "confidence",
+            "sentiment_label",
+            "processing_time",
+            "kafka_timestamp"
+        )
+    )
 
-def on_send_error(exc):
-    """Callback appelé en cas d'erreur d'envoi."""
-    logger.error(f"Erreur envoi Kafka : {exc}")
+    # Ecriture Parquet
+    logger.info(f"Ecriture Parquet -> {SENTIMENT140_PREDICTIONS_DIR}")
+    query = (
+        enriched.writeStream
+        .format("parquet")
+        .outputMode("append")
+        .option("path", str(SENTIMENT140_PREDICTIONS_DIR))
+        .option("checkpointLocation", str(CHECKPOINT_DIR_S140))
+        .trigger(processingTime=f"{STREAMING_TRIGGER_SECONDS} seconds")
+        .start()
+    )
 
-
-def run_producer(
-    csv_path: str = str(SENTIMENT140_CSV),
-    topic: str = KAFKA_TOPIC_SENTIMENT140,
-    delay: float = KAFKA_PRODUCER_DELAY_S140,
-    max_rows: int = None,
-    bootstrap_servers: str = KAFKA_BOOTSTRAP_SERVERS
-):
-    """
-    Pipeline principal du producteur Kafka Sentiment140.
-
-    Args:
-        csv_path: Chemin vers sentiment140.csv
-        topic: Nom du topic Kafka cible
-        delay: Délai entre messages en secondes (défaut: 0.001 = 1ms)
-        max_rows: Limite du nombre de tweets (None = tous les 1,6M)
-        bootstrap_servers: Adresse du broker Kafka
-    """
-    if not Path(csv_path).exists():
-        logger.error(f"Fichier non trouvé : {csv_path}")
-        logger.error("Téléchargez Sentiment140 et placez-le dans data/raw/")
-        sys.exit(1)
-
-    producer = create_producer(bootstrap_servers)
-
-    sent = 0
-    errors = 0
-    start_time = time.time()
-    last_log_time = start_time
-
-    logger.info(f"Démarrage du producteur Kafka")
-    logger.info(f"  Topic   : {topic}")
-    logger.info(f"  Délai   : {delay * 1000:.1f} ms/tweet → ~{1/delay:.0f} tweets/s")
-    logger.info(f"  Limite  : {'Aucune (1,6M tweets)' if max_rows is None else f'{max_rows:,} tweets'}")
+    logger.info(f"Streaming demarre — micro-batch toutes les {STREAMING_TRIGGER_SECONDS}s")
+    logger.info("CTRL+C pour arreter proprement")
 
     try:
-        with open(csv_path, encoding="latin-1", newline="") as f:
-            reader = csv.DictReader(f, fieldnames=S140_COLUMNS)
-
-            for row in reader:
-                if max_rows and sent >= max_rows:
-                    break
-
-                # Ignorer les lignes vides
-                if not row.get("text", "").strip():
-                    continue
-
-                message = build_message(row)
-
-                # Envoi asynchrone avec callbacks
-                producer.send(topic, value=message) \
-                    .add_callback(on_send_success) \
-                    .add_errback(on_send_error)
-
-                sent += 1
-
-                # Log de progression toutes les 100 000 lignes ou 30s
-                now = time.time()
-                if sent % 100_000 == 0 or (now - last_log_time) > 30:
-                    elapsed = now - start_time
-                    rate = sent / elapsed
-                    eta = (1_600_000 - sent) / rate if rate > 0 else 0
-                    logger.info(
-                        f"  Envoyés : {sent:>8,} | "
-                        f"Débit : {rate:>6.0f} tweets/s | "
-                        f"ETA : {eta/60:.1f} min"
-                    )
-                    last_log_time = now
-
-                if delay > 0:
-                    time.sleep(delay)
-
+        import time
+        while query.isActive:
+            progress = query.lastProgress
+            if progress:
+                n = progress.get("numInputRows", 0)
+                if n > 0:
+                    logger.info(f"Micro-batch traite : {n:,} tweets")
+            time.sleep(STREAMING_TRIGGER_SECONDS)
     except KeyboardInterrupt:
-        logger.warning("\nProducteur interrompu par l'utilisateur (CTRL+C)")
+        logger.warning("Consumer interrompu (CTRL+C)")
+        query.stop()
     finally:
-        producer.flush()  # Garantit l'envoi de tous les messages en attente
-        producer.close()
-
-        elapsed = time.time() - start_time
-        logger.info(f"\n── Résumé du producteur ──")
-        logger.info(f"  Tweets envoyés  : {sent:,}")
-        logger.info(f"  Erreurs         : {errors:,}")
-        logger.info(f"  Durée totale    : {elapsed/60:.1f} minutes")
-        logger.info(f"  Débit moyen     : {sent/elapsed:.0f} tweets/s")
+        spark.stop()
+        logger.info("SparkSession fermee")
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(
-        description="Producteur Kafka — Sentiment140 Big Data Stream"
-    )
-    parser.add_argument("--csv", default=str(SENTIMENT140_CSV),
-                        help="Chemin vers sentiment140.csv")
-    parser.add_argument("--topic", default=KAFKA_TOPIC_SENTIMENT140,
-                        help="Topic Kafka cible")
-    parser.add_argument("--delay", type=float, default=KAFKA_PRODUCER_DELAY_S140,
-                        help="Délai entre messages (secondes)")
-    parser.add_argument("--max-rows", type=int, default=None,
-                        help="Nombre maximum de tweets à envoyer")
-    parser.add_argument("--bootstrap-servers", default=KAFKA_BOOTSTRAP_SERVERS,
-                        help="Adresse du broker Kafka")
-    args = parser.parse_args()
-
-    run_producer(
-        csv_path=args.csv,
-        topic=args.topic,
-        delay=args.delay,
-        max_rows=args.max_rows,
-        bootstrap_servers=args.bootstrap_servers
-    )
+    run_streaming_consumer()

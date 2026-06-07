@@ -18,7 +18,6 @@ Usage :
 import sys
 import time
 from pathlib import Path
-from datetime import datetime, timedelta
 
 import streamlit as st
 import plotly.express as px
@@ -36,39 +35,101 @@ from config.config import (
 )
 from src.utils import compute_reputation_score, get_bad_buzz_status
 
+# ─── Palette (thème sombre, inspiré du mockup fourni) ─────────────────────────
+COLOR_BG        = "#0E1117"   # Fond général
+COLOR_CARD      = "#171B23"   # Fond des cartes
+COLOR_CARD_ALT  = "#1B2028"   # Fond cartes secondaires / sidebar
+COLOR_BORDER    = "#2A2F3A"   # Bordures discrètes
+COLOR_ACCENT    = "#3B82F6"   # Bleu accent
+COLOR_POSITIVE  = "#22C55E"   # Vert
+COLOR_NEGATIVE  = "#EF4444"   # Rouge
+COLOR_NEUTRAL   = "#9CA3AF"   # Gris
+COLOR_TEXT      = "#F5F6F8"   # Texte principal (blanc cassé — forte lisibilité sur fond sombre)
+COLOR_SUBTEXT   = "#C7CCD4"   # Texte secondaire (gris clair — reste lisible sur fond sombre)
+
+SENTIMENT_COLORS = {"Positive": COLOR_POSITIVE, "Negative": COLOR_NEGATIVE, "Neutral": COLOR_NEUTRAL}
+
 # ─── Configuration Streamlit ──────────────────────────────────────────────────
 st.set_page_config(
     page_title="Sentiment Analysis Dashboard",
-    page_icon="📊",
+    page_icon=None,
     layout="wide",
     initial_sidebar_state="expanded"
 )
 
-# ─── CSS personnalisé ─────────────────────────────────────────────────────────
-st.markdown("""
+# ─── CSS personnalisé — thème sombre, cartes arrondies ────────────────────────
+st.markdown(f"""
 <style>
-    .metric-card {
-        background: linear-gradient(135deg, #1e3a5f 0%, #2980b9 100%);
-        padding: 1rem; border-radius: 10px; color: white; text-align: center;
-    }
-    .bad-buzz-alert {
-        background: linear-gradient(135deg, #c0392b 0%, #e74c3c 100%);
-        padding: 1rem; border-radius: 10px; color: white; font-weight: bold;
-        font-size: 1.1rem; text-align: center; animation: pulse 1s infinite;
-    }
-    .stable-status {
-        background: linear-gradient(135deg, #27ae60 0%, #2ecc71 100%);
-        padding: 1rem; border-radius: 10px; color: white; text-align: center;
-    }
-    .surveillance-status {
-        background: linear-gradient(135deg, #e67e22 0%, #f39c12 100%);
-        padding: 1rem; border-radius: 10px; color: white; text-align: center;
-    }
-    .header-title {
-        font-size: 2rem; font-weight: bold;
-        background: linear-gradient(90deg, #1e3a5f, #2980b9);
-        -webkit-background-clip: text; -webkit-text-fill-color: transparent;
-    }
+    html, body, [class*="css"] {{
+        font-family: 'Segoe UI', -apple-system, BlinkMacSystemFont, Roboto, sans-serif;
+    }}
+    .stApp {{
+        background-color: {COLOR_BG}; color: {COLOR_TEXT};
+    }}
+    [data-testid="stHeader"], [data-testid="stToolbar"], [data-testid="stDecoration"] {{
+        background-color: {COLOR_BG} !important; background-image: none !important;
+    }}
+    [data-testid="stSidebar"] {{
+        background-color: {COLOR_CARD_ALT}; border-right: 1px solid {COLOR_BORDER};
+    }}
+    [data-testid="stSidebar"] * {{
+        color: {COLOR_TEXT};
+    }}
+    [data-testid="stCaptionContainer"], small, .stCaption {{
+        color: {COLOR_SUBTEXT} !important;
+    }}
+    .header-title {{
+        font-size: 1.9rem; font-weight: 600; color: {COLOR_TEXT};
+        margin-bottom: 0.1rem; letter-spacing: -0.01rem;
+    }}
+    .header-subtitle {{
+        font-size: 0.9rem; color: {COLOR_SUBTEXT}; margin-bottom: 1rem;
+    }}
+    .section-title {{
+        font-size: 1.05rem; font-weight: 600; color: {COLOR_TEXT};
+        margin: 0.25rem 0 0.75rem 0; border-left: 3px solid {COLOR_ACCENT};
+        padding-left: 0.6rem;
+    }}
+    .status-banner {{
+        border-radius: 10px; padding: 0.9rem 1.2rem; font-size: 0.95rem;
+        font-weight: 600; border: 1px solid; margin-bottom: 0.5rem;
+    }}
+    .status-alert {{
+        background: rgba(239,68,68,0.12); border-color: {COLOR_NEGATIVE}; color: #FCA5A5;
+    }}
+    .status-watch {{
+        background: rgba(245,158,11,0.12); border-color: #F59E0B; color: #FCD34D;
+    }}
+    .status-stable {{
+        background: rgba(34,197,94,0.12); border-color: {COLOR_POSITIVE}; color: #86EFAC;
+    }}
+    .status-nodata {{
+        background: {COLOR_CARD}; border-color: {COLOR_BORDER}; color: {COLOR_SUBTEXT};
+    }}
+    /* Cartes KPI */
+    [data-testid="stMetric"] {{
+        background: {COLOR_CARD}; border: 1px solid {COLOR_BORDER}; border-radius: 14px;
+        padding: 1rem 1.1rem 0.8rem 1.1rem;
+    }}
+    [data-testid="stMetricLabel"] {{
+        color: {COLOR_SUBTEXT}; font-size: 0.82rem; font-weight: 500;
+    }}
+    [data-testid="stMetricValue"] {{
+        color: {COLOR_TEXT}; font-weight: 700;
+    }}
+    /* Conteneurs de graphiques */
+    [data-testid="stVerticalBlockBorderWrapper"] {{
+        border-radius: 14px;
+    }}
+    div[data-testid="stExpander"] {{
+        background: {COLOR_CARD}; border: 1px solid {COLOR_BORDER}; border-radius: 14px;
+    }}
+    [data-testid="stDataFrame"] {{
+        border-radius: 10px; overflow: hidden;
+    }}
+    hr {{
+        border-color: {COLOR_BORDER};
+    }}
 </style>
 """, unsafe_allow_html=True)
 
@@ -147,18 +208,18 @@ def render_kpi_row(kpis: dict):
     col1, col2, col3, col4, col5 = st.columns(5)
 
     with col1:
-        st.metric("📊 Total Tweets", f"{kpis['total']:,}")
+        st.metric("Total Tweets", f"{kpis['total']:,}")
     with col2:
-        st.metric("😊 Positifs", f"{kpis['pct_pos']:.1f}%",
+        st.metric("Positive", f"{kpis['pct_pos']:.1f}%",
                   delta=f"{kpis['positive']:,} tweets")
     with col3:
-        st.metric("😤 Négatifs", f"{kpis['pct_neg']:.1f}%",
+        st.metric("Negative", f"{kpis['pct_neg']:.1f}%",
                   delta=f"{kpis['negative']:,} tweets", delta_color="inverse")
     with col4:
-        st.metric("😐 Neutres", f"{kpis['pct_neutral']:.1f}%",
+        st.metric("Neutral", f"{kpis['pct_neutral']:.1f}%",
                   delta=f"{kpis['neutral']:,} tweets")
     with col5:
-        st.metric("⭐ Score Réputation", f"{kpis['reputation_score']:.1f}/100")
+        st.metric("Reputation Score", f"{kpis['reputation_score']:.1f} / 100")
 
 
 def render_bad_buzz_alert(kpis: dict):
@@ -168,24 +229,29 @@ def render_bad_buzz_alert(kpis: dict):
 
     if status == "BAD_BUZZ":
         st.markdown(
-            f"<div class='bad-buzz-alert'>🚨 ALERTE BAD BUZZ — "
-            f"Score Réputation : {score:.1f}/100 — "
-            f"Taux négatif : {kpis['pct_neg']:.1f}% (seuil : {BAD_BUZZ_THRESHOLD*100:.0f}%)</div>",
+            f"<div class='status-banner status-alert'>Alert — Negative sentiment threshold exceeded "
+            f"&nbsp;|&nbsp; Reputation score: {score:.1f}/100 "
+            f"&nbsp;|&nbsp; Negative rate: {kpis['pct_neg']:.1f}% "
+            f"(threshold: {BAD_BUZZ_THRESHOLD*100:.0f}%)</div>",
             unsafe_allow_html=True
         )
     elif status == "SURVEILLANCE":
         st.markdown(
-            f"<div class='surveillance-status'>⚠️ SURVEILLANCE — "
-            f"Score : {score:.1f}/100 — "
-            f"Taux négatif : {kpis['pct_neg']:.1f}%</div>",
+            f"<div class='status-banner status-watch'>Monitoring — Elevated negative sentiment "
+            f"&nbsp;|&nbsp; Reputation score: {score:.1f}/100 "
+            f"&nbsp;|&nbsp; Negative rate: {kpis['pct_neg']:.1f}%</div>",
             unsafe_allow_html=True
         )
     elif status == "NO_DATA":
-        st.info("⏳ En attente de données... Lancez le producteur Kafka.")
+        st.markdown(
+            "<div class='status-banner status-nodata'>Awaiting data — start the Kafka producer "
+            "to begin streaming tweets.</div>",
+            unsafe_allow_html=True
+        )
     else:
         st.markdown(
-            f"<div class='stable-status'>✅ STABLE — "
-            f"Score Réputation : {score:.1f}/100</div>",
+            f"<div class='status-banner status-stable'>Stable — "
+            f"Reputation score: {score:.1f}/100</div>",
             unsafe_allow_html=True
         )
 
@@ -193,7 +259,7 @@ def render_bad_buzz_alert(kpis: dict):
 def render_sentiment_timeline(df: pd.DataFrame):
     """Courbe d'évolution temporelle des sentiments (fenêtre glissante 5 min)."""
     if df.empty or "processing_time" not in df.columns:
-        st.info("Pas encore de données temporelles")
+        st.caption("No time-series data available yet.")
         return
 
     df_time = df.dropna(subset=["processing_time"]).copy()
@@ -214,77 +280,55 @@ def render_sentiment_timeline(df: pd.DataFrame):
             timeline[col] = 0
 
     fig = go.Figure()
-    colors = {"Positive": "#27ae60", "Negative": "#e74c3c", "Neutral": "#95a5a6"}
 
     for label in ["Positive", "Negative", "Neutral"]:
         fig.add_trace(go.Scatter(
             x=timeline["minute"], y=timeline[label],
-            name=label, mode="lines+markers",
-            line=dict(color=colors[label], width=2),
-            fill="tozeroy", fillcolor=colors[label].replace(")", ",0.15)").replace("rgb", "rgba") if "#" not in colors[label] else None
+            name=label, mode="lines",
+            line=dict(color=SENTIMENT_COLORS[label], width=2),
         ))
 
     fig.update_layout(
-        title="📈 Évolution temporelle des sentiments (par minute)",
-        xaxis_title="Temps", yaxis_title="Nombre de tweets",
-        legend_title="Sentiment", height=350,
-        paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)"
+        title="Sentiment trend over time (per minute)",
+        xaxis_title="Time", yaxis_title="Number of tweets",
+        height=370,
+        font=dict(family="Segoe UI, sans-serif", color=COLOR_TEXT),
+        paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
+        margin=dict(t=60, l=60, r=20, b=60),
+        showlegend=True,
+        legend=dict(orientation="h", yanchor="top", y=-0.28, x=0, title=None)
     )
-    st.plotly_chart(fig, use_container_width=True)
+    fig.update_xaxes(showgrid=True, gridcolor=COLOR_BORDER, title_standoff=15, automargin=True)
+    fig.update_yaxes(showgrid=True, gridcolor=COLOR_BORDER, title_standoff=15, automargin=True)
+    st.plotly_chart(fig, use_container_width=True, theme=None)
 
 
 def render_sentiment_pie(kpis: dict):
     """Camembert Positive / Negative / Neutral."""
-    labels = ["Positifs", "Négatifs", "Neutres"]
+    labels = ["Positive", "Negative", "Neutral"]
     values = [kpis["positive"], kpis["negative"], kpis["neutral"]]
-    colors = ["#27ae60", "#e74c3c", "#95a5a6"]
+    colors = [SENTIMENT_COLORS[l] for l in labels]
 
     fig = go.Figure(go.Pie(
         labels=labels, values=values,
-        marker_colors=colors, hole=0.4,
+        marker_colors=colors, hole=0.55,
         textinfo="label+percent"
     ))
     fig.update_layout(
-        title="🥧 Répartition des sentiments",
+        title="Sentiment distribution",
         height=300,
-        showlegend=True,
+        showlegend=False,
+        font=dict(family="Segoe UI, sans-serif", color=COLOR_TEXT),
+        margin=dict(t=50, l=10, r=10, b=10),
         paper_bgcolor="rgba(0,0,0,0)"
     )
-    st.plotly_chart(fig, use_container_width=True)
-
-
-def render_reputation_gauge(score: float):
-    """Jauge de réputation [0, 100]."""
-    color = "#e74c3c" if score < 30 else "#e67e22" if score < 50 else "#27ae60"
-
-    fig = go.Figure(go.Indicator(
-        mode="gauge+number+delta",
-        value=score,
-        delta={"reference": 50},
-        domain={"x": [0, 1], "y": [0, 1]},
-        title={"text": "Score de Réputation"},
-        gauge={
-            "axis": {"range": [0, 100]},
-            "bar": {"color": color},
-            "steps": [
-                {"range": [0, 30], "color": "#fadbd8"},
-                {"range": [30, 70], "color": "#fdebd0"},
-                {"range": [70, 100], "color": "#d5f5e3"}
-            ],
-            "threshold": {
-                "line": {"color": "#1e3a5f", "width": 4},
-                "thickness": 0.75, "value": 50
-            }
-        }
-    ))
-    fig.update_layout(height=280, paper_bgcolor="rgba(0,0,0,0)")
-    st.plotly_chart(fig, use_container_width=True)
+    st.plotly_chart(fig, use_container_width=True, theme=None)
 
 
 def render_product_distribution(df: pd.DataFrame):
     """Distribution des sentiments par produit Apple (histogramme groupé)."""
     if "product" not in df.columns or df.empty:
-        st.info("Données par produit Apple non disponibles")
+        st.caption("Product-level data is not available.")
         return
 
     prod_df = (
@@ -296,18 +340,19 @@ def render_product_distribution(df: pd.DataFrame):
     fig = px.bar(
         prod_df, x="product", y="count", color="sentiment_label",
         barmode="group",
-        color_discrete_map={
-            "Positive": "#27ae60",
-            "Negative": "#e74c3c",
-            "Neutral":  "#95a5a6"
-        },
-        title="📱 Distribution des sentiments par produit Apple"
+        color_discrete_map=SENTIMENT_COLORS,
+        title="Sentiment by product"
     )
     fig.update_layout(
-        height=350, xaxis_title="Produit", yaxis_title="Nombre de tweets",
+        height=320, xaxis_title="Product", yaxis_title="Number of tweets",
+        legend_title="Sentiment",
+        font=dict(family="Segoe UI, sans-serif", color=COLOR_TEXT),
+        margin=dict(t=50, l=60, r=20, b=60),
         paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)"
     )
-    st.plotly_chart(fig, use_container_width=True)
+    fig.update_xaxes(showgrid=False, title_standoff=15, automargin=True)
+    fig.update_yaxes(showgrid=True, gridcolor=COLOR_BORDER, title_standoff=15, automargin=True)
+    st.plotly_chart(fig, use_container_width=True, theme=None)
 
 
 def render_top_negative_tweets(df: pd.DataFrame, n: int = TOP_NEGATIVE_TWEETS_N):
@@ -322,16 +367,16 @@ def render_top_negative_tweets(df: pd.DataFrame, n: int = TOP_NEGATIVE_TWEETS_N)
     )
 
     if top_neg.empty:
-        st.info("Aucun tweet très négatif (seuil 75%) détecté pour le moment")
+        st.caption("No strongly negative tweets (threshold 75%) detected at the moment.")
         return
 
     top_neg = top_neg.rename(columns={
-        "text": "Texte du tweet",
-        "prob_negative": "P(Négatif)",
-        "product": "Produit"
+        "text": "Tweet text",
+        "prob_negative": "P(negative)",
+        "product": "Product"
     })
-    top_neg["P(Négatif)"] = top_neg["P(Négatif)"].round(3)
-    st.dataframe(top_neg, use_container_width=True)
+    top_neg["P(negative)"] = top_neg["P(negative)"].round(3)
+    st.dataframe(top_neg, use_container_width=True, hide_index=True)
 
 
 def render_confidence_histogram(df: pd.DataFrame):
@@ -341,68 +386,47 @@ def render_confidence_histogram(df: pd.DataFrame):
 
     fig = px.histogram(
         df, x="confidence", color="sentiment_label", nbins=50,
-        color_discrete_map={
-            "Positive": "#27ae60", "Negative": "#e74c3c", "Neutral": "#95a5a6"
-        },
-        title="📊 Distribution des scores de confiance ML"
+        color_discrete_map=SENTIMENT_COLORS,
+        title="Model confidence distribution"
     )
     fig.add_vline(x=CONFIDENCE_THRESHOLD, line_dash="dash",
-                  line_color="#1e3a5f",
-                  annotation_text=f"Seuil Neutral ({CONFIDENCE_THRESHOLD})")
-    fig.update_layout(height=300, paper_bgcolor="rgba(0,0,0,0)",
+                  line_color=COLOR_ACCENT,
+                  annotation_text=f"Neutral threshold ({CONFIDENCE_THRESHOLD})")
+    fig.update_layout(height=320, legend_title="Sentiment",
+                      xaxis_title="Confidence", yaxis_title="Number of tweets",
+                      font=dict(family="Segoe UI, sans-serif", color=COLOR_TEXT),
+                      margin=dict(t=50, l=60, r=20, b=60),
+                      paper_bgcolor="rgba(0,0,0,0)",
                       plot_bgcolor="rgba(0,0,0,0)")
-    st.plotly_chart(fig, use_container_width=True)
+    fig.update_xaxes(showgrid=False, title_standoff=15, automargin=True)
+    fig.update_yaxes(showgrid=True, gridcolor=COLOR_BORDER, title_standoff=15, automargin=True)
+    st.plotly_chart(fig, use_container_width=True, theme=None)
 
 
 # ─── Layout principal ─────────────────────────────────────────────────────────
 
 def main():
     # ── En-tête ───────────────────────────────────────────────────────────────
-    st.markdown(f"<div class='header-title'>📊 {DASHBOARD_TITLE}</div>",
-                unsafe_allow_html=True)
-    st.caption(f"Kafka · Spark Structured Streaming · MLlib · Parquet | "
-               f"Rafraîchissement : {DASHBOARD_REFRESH_SECONDS}s")
+    st.markdown(f"<div class='header-title'>{DASHBOARD_TITLE}</div>", unsafe_allow_html=True)
+    st.markdown(
+        "<div class='header-subtitle'>Monitor brand reputation and detect sentiment shifts as they happen.</div>",
+        unsafe_allow_html=True
+    )
 
     # ── Sidebar ───────────────────────────────────────────────────────────────
     with st.sidebar:
-        st.image("https://img.shields.io/badge/Kafka-231F20?style=flat&logo=apache-kafka",
-                 use_column_width=True)
-        st.title("🎛️ Paramètres")
+        st.markdown("**Settings**")
 
         source = st.radio(
-            "📂 Source de données",
-            ["Apple Brand Monitoring (Phase 3)", "Sentiment140 Big Data (Phase 2)"]
+            "Data source",
+            ["Apple Brand Monitoring", "General Public Stream"]
         )
 
         st.divider()
-        st.subheader("⚙️ Seuils")
-        conf_threshold = st.slider(
-            "Seuil Neutral (confiance ML)",
-            min_value=0.50, max_value=0.90, value=CONFIDENCE_THRESHOLD, step=0.05
-        )
-        buzz_threshold = st.slider(
-            "Seuil Bad Buzz (taux négatif)",
-            min_value=0.50, max_value=0.90, value=BAD_BUZZ_THRESHOLD, step=0.05
-        )
+        auto_refresh = st.checkbox("Auto-refresh", value=True)
 
         st.divider()
-        auto_refresh = st.checkbox("🔄 Rafraîchissement automatique", value=True)
-
-        st.divider()
-        st.subheader("📌 Architecture")
-        st.markdown("""
-        **Phase 1** — Batch Training  
-        `Sentiment140 → Spark MLlib`
-        
-        **Phase 2** — Big Data Streaming  
-        `Kafka → Spark → Parquet`
-        
-        **Phase 3** — Brand Monitoring  
-        `Apple Tweets → Dashboard`
-        """)
-
-        st.divider()
-        if st.button("🔄 Actualiser maintenant"):
+        if st.button("Refresh now"):
             st.cache_data.clear()
             st.rerun()
 
@@ -410,69 +434,68 @@ def main():
     is_apple = "Apple" in source
     data_path = APPLE_PREDICTIONS_DIR if is_apple else SENTIMENT140_PREDICTIONS_DIR
 
-    with st.spinner("Chargement des prédictions depuis le Data Lake..."):
+    with st.spinner("Loading predictions from the data lake..."):
         df = load_predictions(data_path)
 
     # ── Filtre produit Apple ──────────────────────────────────────────────────
     if is_apple and not df.empty and "product" in df.columns:
-        products = ["Tous"] + sorted(df["product"].dropna().unique().tolist())
-        selected_product = st.sidebar.selectbox("📱 Filtrer par produit", products)
-        if selected_product != "Tous":
+        products = ["All"] + sorted(df["product"].dropna().unique().tolist())
+        selected_product = st.sidebar.selectbox("Filter by product", products)
+        if selected_product != "All":
             df = df[df["product"] == selected_product]
 
     # ── KPIs ──────────────────────────────────────────────────────────────────
     kpis = compute_kpis(df)
 
-    st.subheader(f"{'🍎 Apple Brand Monitoring' if is_apple else '📡 Sentiment140 Big Data Stream'}")
+    st.markdown(
+        f"<div class='section-title'>"
+        f"{'Apple Brand Monitoring' if is_apple else 'General Public Stream'}</div>",
+        unsafe_allow_html=True
+    )
     render_bad_buzz_alert(kpis)
-    st.divider()
+    st.markdown("<br>", unsafe_allow_html=True)
     render_kpi_row(kpis)
-    st.divider()
 
-    # ── Visualisations ────────────────────────────────────────────────────────
-    col_left, col_right = st.columns([2, 1])
+    st.markdown("<br>", unsafe_allow_html=True)
 
-    with col_left:
-        render_sentiment_timeline(df)
+    # ── Graphiques — regroupés en haut, dans des cadres délimités ─────────────
+    with st.container(border=True):
+        col_trend, col_dist = st.columns([2, 1])
+        with col_trend:
+            render_sentiment_timeline(df)
+        with col_dist:
+            render_sentiment_pie(kpis)
 
-    with col_right:
-        render_reputation_gauge(kpis["reputation_score"])
+    st.markdown("<br>", unsafe_allow_html=True)
 
-    col1, col2 = st.columns(2)
+    with st.container(border=True):
+        if is_apple:
+            col_a, col_b = st.columns(2)
+            with col_a:
+                render_confidence_histogram(df)
+            with col_b:
+                render_product_distribution(df)
+        else:
+            render_confidence_histogram(df)
 
-    with col1:
-        render_sentiment_pie(kpis)
+    st.markdown("<br>", unsafe_allow_html=True)
 
-    with col2:
-        render_confidence_histogram(df)
+    # ── Sections textuelles — regroupées en bas ──────────────────────────────
+    with st.container(border=True):
+        st.markdown(f"<div class='section-title'>Top {TOP_NEGATIVE_TWEETS_N} most negative tweets</div>",
+                    unsafe_allow_html=True)
+        render_top_negative_tweets(df)
 
-    # Visualisations spécifiques Apple
-    if is_apple:
-        render_product_distribution(df)
+    st.markdown("<br>", unsafe_allow_html=True)
 
-    # ── Top tweets négatifs ───────────────────────────────────────────────────
-    st.subheader(f"🚨 Top {TOP_NEGATIVE_TWEETS_N} Tweets les plus négatifs")
-    render_top_negative_tweets(df)
-
-    # ── Données brutes ────────────────────────────────────────────────────────
-    with st.expander("🗃️ Données brutes (derniers tweets traités)"):
+    with st.expander("Raw data (most recent processed tweets)"):
         if not df.empty:
             cols_to_show = [c for c in
                 ["text", "sentiment_label", "confidence", "product", "processing_time"]
                 if c in df.columns]
-            st.dataframe(df[cols_to_show].head(50), use_container_width=True)
+            st.dataframe(df[cols_to_show].head(50), use_container_width=True, hide_index=True)
         else:
-            st.warning("Aucune donnée disponible. Le pipeline de streaming est-il actif ?")
-
-    # ── Pied de page ──────────────────────────────────────────────────────────
-    st.divider()
-    col_a, col_b, col_c = st.columns(3)
-    with col_a:
-        st.caption(f"⏱️ Dernière mise à jour : {datetime.now().strftime('%H:%M:%S')}")
-    with col_b:
-        st.caption(f"📦 {kpis['total']:,} tweets analysés")
-    with col_c:
-        st.caption(f"🎯 Seuil confiance : {conf_threshold} | Seuil buzz : {buzz_threshold*100:.0f}%")
+            st.warning("No data available. Is the streaming pipeline running?")
 
     # ── Rafraîchissement automatique ──────────────────────────────────────────
     if auto_refresh:
